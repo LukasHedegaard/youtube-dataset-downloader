@@ -1,0 +1,485 @@
+""" YouTube Dataset Downloader
+The implementation is based on https://github.com/activitynet/ActivityNet/tree/master/Crawler/Kinetics
+"""
+
+import argparse
+import json
+import os
+import shutil
+import subprocess
+from typing import Dict
+from collections import OrderedDict
+from pathlib import Path
+
+from joblib import delayed
+from joblib import Parallel
+import pandas as pd
+from functools import partial
+
+import random
+
+
+def generate_key():
+    STR_KEY_GEN = "ABCDEFGHIJKLMNOPQRSTUVWXYzabcdefghijklmnopqrstuvwxyz"
+    return "".join(random.choice(STR_KEY_GEN) for _ in range(20))
+
+
+erf = "errorlog" + generate_key()
+
+
+def create_video_folders(dataset, output_dir, tmp_dir):
+    """Creates a directory for each label name in the dataset."""
+    if "label-name" not in dataset.columns:
+        this_dir = os.path.join(output_dir, "test")
+        if not os.path.exists(this_dir):
+            os.makedirs(this_dir)
+        # I should return a dict but ...
+        return this_dir
+    if not os.path.exists(output_dir):
+        os.makedirs(output_dir)
+    if not os.path.exists(tmp_dir):
+        os.makedirs(tmp_dir)
+
+    label_to_dir = {}
+    for label_name in dataset["label-name"].unique():
+        this_dir = os.path.join(output_dir, label_name)
+        if not os.path.exists(this_dir):
+            os.makedirs(this_dir)
+        label_to_dir[label_name] = this_dir
+    return label_to_dir
+
+
+def construct_trimmed_video_filename(row, label_to_dir, trim_format="%06d"):
+    """Given a dataset row, this function constructs the
+       output filename for a given video.
+    """
+    basename = "%s_%s_%s.mp4" % (
+        row["video-id"],
+        trim_format % row["start-time"],
+        trim_format % row["end-time"],
+    )
+    if not isinstance(label_to_dir, dict):
+        dirname = label_to_dir
+    else:
+        dirname = label_to_dir[row["label-name"]]
+    output_filename = os.path.join(dirname, basename)
+    return output_filename
+
+
+def construct_video_filename(row, label_to_dir):
+    """Given a dataset row, this function constructs the
+       output filename for a given video.
+    """
+    basename = f"{row['video-id']}.mp4"
+    if not isinstance(label_to_dir, dict):
+        dirname = label_to_dir
+    else:
+        dirname = label_to_dir[row["label-name"]]
+    output_filename = os.path.join(dirname, basename)
+    return output_filename
+
+
+def download_and_trim_clip(
+    video_identifier,
+    output_filename,
+    start_time,
+    end_time,
+    tmp_dir="/tmp/youtube-dl",
+    num_attempts=2,
+    url_base="https://www.youtube.com/watch?v=",
+):
+    """Download a video from youtube if exists and is not blocked.
+
+    arguments:
+    ---------
+    video_identifier: str
+        Unique YouTube video identifier (11 characters)
+    output_filename: str
+        File path where the video will be stored.
+    start_time: float
+        Indicates the begining time in seconds from where the video
+        will be trimmed.
+    end_time: float
+        Indicates the ending time in seconds of the trimmed video.
+    """
+    # Defensive argument checking.
+    assert isinstance(video_identifier, str), "video_identifier must be string"
+    assert isinstance(output_filename, str), "output_filename must be string"
+    assert len(video_identifier) == 11, "video_identifier must have length 11"
+
+    status = False
+    # Construct command line for getting the direct video link.
+    tmp_filename = os.path.join(tmp_dir, f"{video_identifier}.mp4")
+
+    if not os.path.exists(output_filename):
+
+        command = f'youtube-dl -f mp4 --quiet --no-warnings -o {tmp_filename} "{url_base + video_identifier}" && ffmpeg -i {tmp_filename} -ss {str(start_time)} -t {str(end_time - start_time)} -threads 1 -c:v libx264 -c:a copy -loglevel error "{output_filename}" -f mp4 -y'
+
+        attempts = 0
+        while True:
+            try:
+                subprocess.check_output(command, shell=True, stderr=subprocess.STDOUT)
+            except subprocess.CalledProcessError as err:
+                attempts += 1
+                if attempts == num_attempts:
+                    return status, f"{str(err.output)[:500]}"
+            else:
+                break
+
+    # Check if the video was successfully saved.
+    status = os.path.exists(output_filename)
+    try:
+        os.remove(tmp_filename)
+    except Exception:
+        pass
+    return status, "Downloaded"
+
+
+def download_clip(
+    video_identifier,
+    output_filename,
+    tmp_dir="/tmp/youtube-dl",
+    num_attempts=2,
+    url_base="https://www.youtube.com/watch?v=",
+):
+    """Download a video from youtube if exists and is not blocked.
+
+    arguments:
+    ---------
+    video_identifier: str
+        Unique YouTube video identifier (11 characters)
+    output_filename: str
+        File path where the video will be stored.
+    """
+    # Defensive argument checking.
+    assert isinstance(video_identifier, str), "video_identifier must be string"
+    assert isinstance(output_filename, str), "output_filename must be string"
+    assert len(video_identifier) == 11, "video_identifier must have length 11"
+
+    status = False
+    # Construct command line for getting the direct video link.
+    tmp_filename = os.path.join(tmp_dir, f"{video_identifier}.mp4")
+
+    if not os.path.exists(output_filename):
+
+        command = f'youtube-dl -f mp4 --quiet --no-warnings -o {tmp_filename} "{url_base + video_identifier}" && mv {tmp_filename} {output_filename}'
+
+        attempts = 0
+        while True:
+            try:
+                subprocess.check_output(command, shell=True, stderr=subprocess.STDOUT)
+            except subprocess.CalledProcessError as err:
+                attempts += 1
+                if attempts == num_attempts:
+                    return status, f"{str(err.output)[:500]}"
+            else:
+                break
+
+    # Check if the video was successfully saved.
+    status = os.path.exists(output_filename)
+    try:
+        os.remove(tmp_filename)
+    except Exception:
+        pass
+    return status, "Downloaded"
+
+
+def download_and_trim_clip_wrapper(
+    row, label_to_dir, trim_format, tmp_dir, existing_files: Dict[str, Path] = {}
+):
+    """Wrapper for parallel processing purposes."""
+    output_filename = construct_trimmed_video_filename(row, label_to_dir, trim_format)
+    clip_id = os.path.basename(output_filename).split(".mp4")[0]
+
+    if clip_id in existing_files:
+        shutil.copyfile(src=existing_files[clip_id], dst=output_filename)
+        status = (clip_id, "Copied", output_filename)
+        print(status)
+
+    if os.path.exists(output_filename):
+        check_for_errors_in_file = (
+            f'ffmpeg -v error -i "{output_filename}" -f null - 2>{erf} && cat {erf}'
+        )
+        try:
+            output = subprocess.check_output(
+                check_for_errors_in_file, shell=True, stderr=subprocess.STDOUT
+            )
+            if not output:
+                status = (clip_id, "Exists", output_filename)
+                print(status)
+                return status
+            output = subprocess.check_output(
+                f"rm {erf}", shell=True, stderr=subprocess.STDOUT
+            )
+        except subprocess.CalledProcessError as err:
+            print(err)
+
+        print(f"Removing corrupted file: {output_filename}")
+        try:
+            os.remove(output_filename)
+        except Exception:
+            pass
+        downloaded, log = download_and_trim_clip(
+            row["video-id"],
+            output_filename,
+            row["start-time"],
+            row["end-time"],
+            tmp_dir=tmp_dir,
+        )
+        status = (clip_id, log, output_filename)
+        print(status)
+        return status
+
+    downloaded, log = download_and_trim_clip(
+        row["video-id"],
+        output_filename,
+        row["start-time"],
+        row["end-time"],
+        tmp_dir=tmp_dir,
+    )
+    status = (clip_id, log, output_filename)
+    print(status)
+    return status
+
+
+def download_clip_wrapper(
+    row, label_to_dir, trim_format, tmp_dir, existing_files: Dict[str, Path] = {}
+):
+    """Wrapper for parallel processing purposes."""
+    output_filename = construct_video_filename(row, label_to_dir)
+    clip_id = os.path.basename(output_filename).split(".mp4")[0]
+
+    if clip_id in existing_files:
+        shutil.copyfile(src=existing_files[clip_id], dst=output_filename)
+        status = (clip_id, "Copied", output_filename)
+        print(status)
+
+    if os.path.exists(output_filename):
+        check_for_errors_in_file = (
+            f'ffmpeg -v error -i "{output_filename}" -f null - 2>{erf} && cat {erf}'
+        )
+        try:
+            output = subprocess.check_output(
+                check_for_errors_in_file, shell=True, stderr=subprocess.STDOUT
+            )
+            if not output:
+                status = (clip_id, "Exists", output_filename)
+                print(status)
+                return status
+        except subprocess.CalledProcessError as err:
+            print(err)
+
+        print(f"Removing corrupted file: {output_filename}")
+        try:
+            os.remove(output_filename)
+        except Exception:
+            pass
+        downloaded, log = download_clip(
+            row["video-id"], output_filename, tmp_dir=tmp_dir,
+        )
+        status = (clip_id, downloaded, log, output_filename)
+        print(status)
+        return status
+
+    downloaded, log = download_clip(row["video-id"], output_filename, tmp_dir=tmp_dir,)
+    status = (clip_id, downloaded, log, output_filename)
+    print(status)
+    return status
+
+
+def parse_kinetics_annotations(input_csv, ignore_is_cc=False):
+    """Returns a parsed DataFrame.
+
+    arguments:
+    ---------
+    input_csv: str
+        Path to CSV file containing the following columns:
+          'YouTube Identifier,Start time,End time,Class label'
+
+    returns:
+    -------
+    dataset: DataFrame
+        Pandas with the following columns:
+            'video-id', 'start-time', 'end-time', 'label-name'
+    """
+    df = pd.read_csv(input_csv)
+    if "youtube_id" in df.columns:
+        columns = OrderedDict(
+            [
+                ("youtube_id", "video-id"),
+                ("time_start", "start-time"),
+                ("time_end", "end-time"),
+                ("label", "label-name"),
+            ]
+        )
+        df.rename(columns=columns, inplace=True)
+        if ignore_is_cc:
+            df = df.loc[:, df.columns.tolist()[:-1]]
+    return df
+
+
+def parse_json_annotations(input_json, label2name_path=None, ignore_is_cc=False):
+    """Returns a parsed DataFrame.
+
+    arguments:
+    ---------
+    input_json: str
+        Path to json file containing the following format:
+           "[
+              [youtube_identifier, class_label],
+              ...
+            ]"
+
+    returns:
+    -------
+    dataset: DataFrame
+        Pandas with the following columns:
+            'video-id', 'label-name'
+    """
+    with open(input_json, "r") as f:
+        df = pd.DataFrame.from_records(json.load(f), columns=["video-id", "label-name"])
+
+    if label2name_path:
+        with open(label2name_path, "r") as f:
+            label2name_dict = json.load(f)
+            df["label-name"] = df["label-name"].apply(lambda x: label2name_dict[str(x)])
+
+    if ignore_is_cc:
+        df = df.loc[:, df.columns.tolist()[:-1]]
+    return df
+
+
+def upgrade_youtube_dl():
+    try:
+        subprocess.check_output(
+            "pip3 install --upgrade youtube-dl", shell=True, stderr=subprocess.STDOUT
+        )
+        print("Upgraded youtube-dl")
+    except subprocess.CalledProcessError as err:
+        print(err)
+
+
+def main(
+    input_csv,
+    input_json,
+    label2name,
+    output_dir,
+    trim_format="%06d",
+    num_jobs=24,
+    tmp_dir="/tmp/youtube-download",
+    source_dir="",
+    reverse=False,
+):
+    upgrade_youtube_dl()
+
+    assert bool(input_csv) != bool(
+        input_json
+    ), "Either input_csv or input_json must be supplied, but not both."
+
+    mode = "csv" if input_csv else "json"
+
+    dataset = {
+        "csv": partial(parse_kinetics_annotations, input_csv=input_csv),
+        "json": partial(
+            parse_json_annotations, input_json=input_json, label2name_path=label2name,
+        ),
+    }[mode]()
+
+    if reverse:
+        print("reversing direction")
+        dataset = dataset.iloc[::-1]
+
+    # Make catalogue of existing files
+    source_dir = Path(source_dir) if source_dir else None
+    if source_dir and source_dir.is_dir():
+        print("Looking through source dir")
+        existing_files = (
+            {str(p.stem): p for p in source_dir.rglob("*.mp4")}
+            if source_dir.is_dir()
+            else {}
+        )
+    else:
+        existing_files = {}
+
+    # Creates folders where videos will be saved later.
+    label_to_dir = create_video_folders(dataset, output_dir, tmp_dir)
+
+    run = {
+        "csv": partial(download_and_trim_clip_wrapper, existing_files=existing_files),
+        "json": partial(download_clip_wrapper, existing_files=existing_files),
+    }[mode]
+
+    # Download all clips.
+    if num_jobs == 1:
+        status_lst = []
+        for i, row in dataset.iterrows():
+            status_lst.append(run(row, label_to_dir, trim_format, tmp_dir))
+    else:
+        status_lst = Parallel(n_jobs=num_jobs)(
+            delayed(run)(row, label_to_dir, trim_format, tmp_dir)
+            for i, row in dataset.iterrows()
+        )
+
+    # Clean tmp dir.
+    shutil.rmtree(tmp_dir)
+
+    # Save download report.
+    with open("download_report.json", "w") as fobj:
+        fobj.write(json.dumps(status_lst))
+
+
+if __name__ == "__main__":
+    description = "Helper script for downloading and trimming kinetics videos."
+    p = argparse.ArgumentParser(description=description)
+    p.add_argument(
+        "--input-csv",
+        default="",
+        type=str,
+        help=(
+            "CSV file compatible with the Kinetics datasets in the format: "
+            "YouTube Identifier,Start time,End time,Class label."
+        ),
+    )
+    p.add_argument(
+        "--input-json",
+        default="",
+        type=str,
+        help=(
+            "JSON file compatible with YouTube Birds and Cars containing the following format: "
+            "[ [youtube_identifier, class_label], ...]"
+        ),
+    )
+    p.add_argument(
+        "--label2name",
+        default="",
+        type=str,
+        help=("Path to file containing label to name dict"),
+    )
+    p.add_argument(
+        "--output-dir", type=str, help="Output directory where videos will be saved."
+    )
+    p.add_argument(
+        "-f",
+        "--trim-format",
+        type=str,
+        default="%06d",
+        help=(
+            "Only applies to input_csv"
+            "This will be the format for the "
+            "filename of trimmed videos: "
+            "videoid_%0xd(start_time)_%0xd(end_time).mp4"
+        ),
+    )
+    p.add_argument("-n", "--num-jobs", type=int, default=1)
+    p.add_argument("-t", "--tmp-dir", type=str, default="/tmp/youtube-download")
+    p.add_argument(
+        "-s",
+        "--source-dir",
+        type=str,
+        default="",
+        help="Directory in which to look for files before download.",
+    )
+    p.add_argument(
+        "-r", "--reverse", action="store_true", help="Reverse direction of download."
+    )
+    main(**vars(p.parse_args()))
